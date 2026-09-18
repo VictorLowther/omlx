@@ -280,11 +280,13 @@ def test_non_dict_rope_parameters_is_noop():
 # ---------------------------------------------------------------------------
 
 
-def _reference_rotate(x: np.ndarray, factor: float, start: int) -> np.ndarray:
+def _reference_rotate(
+    x: np.ndarray, factor: float, start: int, scale: float | None = None
+) -> np.ndarray:
     """Half-split rotation of the first ROTARY_DIM lanes with yarn cos/sin."""
     length = x.shape[-2]
     inv = _reference_inv_freq(factor).astype(np.float32)
-    scale = np.float32(_reference_mscale(factor))
+    scale = np.float32(_reference_mscale(factor) if scale is None else scale)
     pos = np.arange(start, start + length, dtype=np.float32)
     theta = pos[:, None] * inv[None, :]
     cos = (np.cos(theta) * scale)[None, None]
@@ -336,6 +338,45 @@ def test_apply_rotary_matches_reference(start, rtol, atol):
     # Passthrough lanes are bit-exact copies.
     assert mx.array_equal(q_out[..., ROTARY_DIM:], q[..., ROTARY_DIM:])
     assert mx.array_equal(k_out[..., ROTARY_DIM:], k[..., ROTARY_DIM:])
+
+
+def test_apply_rotary_at_1m_positions_preserves_mscale():
+    """Published YaRN ceiling (4x native): jitter-bounded lanes, exact mscale.
+
+    At 1M positions the fp32 pos*freq product carries ~0.06 rad of ulp
+    jitter on the hottest lane (measured elementwise deviation vs the
+    float64 reference: <= 0.12), so the elementwise check uses a jitter
+    band instead of a tight rtol. The mscale invariant is asserted through
+    rotary-lane norms, where trig jitter averages out: dropping mscale
+    shifts the norm ratio by ~7%, well outside the 0.5% band.
+    """
+    emb = _bare_rotary()
+    assert yarn_rope.maybe_apply_yarn(emb, QWEN_512K_RECIPE) is True
+    start = 1_000_000
+    rng = np.random.default_rng(0)
+    length = 8
+    head_dim = 128
+    q_np = rng.standard_normal((1, 2, length, head_dim)).astype(np.float32)
+    q = mx.array(q_np)
+    positions = mx.arange(start, start + length, dtype=mx.int32)[None, :]
+
+    q_out, _ = emb.apply_rotary(q, q, positions)
+    got = np.asarray(q_out.tolist())
+
+    want = _reference_rotate(q_np, 2.0, start)
+    dev = np.abs(got[..., :ROTARY_DIM] - want[..., :ROTARY_DIM])
+    assert dev.max() < 0.15, f"rotary deviation {dev.max():.3f} exceeds the jitter band"
+    # Passthrough lanes stay bit-exact even at extreme positions.
+    assert mx.array_equal(q_out[..., ROTARY_DIM:], q[..., ROTARY_DIM:])
+    # mscale via norm ratio: trig jitter cancels, a dropped scale cannot hide.
+    unscaled = _reference_rotate(q_np, 2.0, start, scale=1.0)
+    ratio = np.linalg.norm(got[..., :ROTARY_DIM]) / np.linalg.norm(
+        unscaled[..., :ROTARY_DIM]
+    )
+    mscale = _reference_mscale(2.0)
+    assert abs(ratio - mscale) / mscale < 0.005, (
+        f"rotary norm ratio {ratio:.5f} does not carry mscale {mscale:.5f}"
+    )
 
 
 # ---------------------------------------------------------------------------
