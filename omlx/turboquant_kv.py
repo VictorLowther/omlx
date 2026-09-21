@@ -279,6 +279,11 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         return self.offset if isinstance(self.offset, int) else self._phys_end
 
     def trim(self, n):
+        # Mirrors the dense BatchKVCache.trim contract at B>1: clamp to the
+        # shared physical write end, rewind it, and drop every row's logical
+        # offset uniformly (scalar in, scalar out; the MTP rollback caller
+        # does int(trim(n))). Ragged per-row speculation tails travel via
+        # prepare(right_padding) + finalize()'s packed dynamic_roll instead.
         position = self._idx
         n = min(position, n)
         self.offset -= n
@@ -327,6 +332,16 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         # Drop any stale batch-mode value so _ensure_array_offset re-derives
         # _phys_end from that cursor at the B>1 switch.
         self._phys_end = 0
+
+    def size(self):
+        # The dense BatchKVCache.size() is the scalar physical cursor (_idx);
+        # the packed counterpart is _phys_end. The inherited singleton size()
+        # returns self.offset — a per-row array at B>1 — which crashes scalar
+        # consumers such as BatchQSAKVCache.extend's KV/indexer alignment
+        # check when a late prefill joins a live packed generation batch.
+        if isinstance(self.offset, int):
+            return super().size()
+        return self._phys_end
 
     # ---- make_mask override (batch-aware) ----------------------------------
 

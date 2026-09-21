@@ -368,13 +368,16 @@ def qwen4_qsa_sparse_gqa_attention_tq(
     dimension_tile: int = 64,
     stream=None,
 ) -> mx.array:
-    """Exact Qwen4 main GQA over TurboQuant 4-bit MSE packed K/V.
+    """Exact Qwen4 main GQA over TurboQuant MSE packed K/V.
 
     Packed-state counterpart of ``qwen4_qsa_sparse_gqa_attention`` with the
     same narrow ABI (batch-one 24q/2kv/D256, 512 chronological uint32 block
-    IDs, causal tail in-kernel, FP32 online softmax). Queries must be
-    pre-rotated into the key codec's frame; the fp32 output stays in the
-    value codec's rotated frame — the caller applies the inverse rotation.
+    IDs, causal tail in-kernel, FP32 online softmax). Per-side bit widths
+    are inferred from the codebook sizes (2^bits entries, bits in
+    {2, 3, 4, 6, 8}) and cross-checked against the packed row widths.
+    Queries must be pre-rotated into the key codec's frame; the fp32 output
+    stays in the value codec's rotated frame — the caller applies the
+    inverse rotation.
     """
 
     if _ext is None or not hasattr(_ext, "qwen4_qsa_sparse_gqa_attention_tq"):

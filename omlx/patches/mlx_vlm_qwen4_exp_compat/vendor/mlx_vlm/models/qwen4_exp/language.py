@@ -2115,12 +2115,13 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             # inside a measured band: below the floor the mask kernel has
             # less work than the per-query gather; above the ceiling the
             # portable materialization collapses — but the native packed-row
-            # kernel (when built) runs at the dense arm's rate at any context.
+            # kernel (when built, at an instantiated bit width) runs at the
+            # dense arm's rate at any context.
             if prospective <= _tq_gathered_prefill_min_context():
                 return False
             ceiling = _tq_gathered_prefill_max_context()
             if ceiling and prospective > ceiling:
-                return native_qsa_tq_available()
+                return native_qsa_tq_available(cache.bits)
             return True
         return True
 

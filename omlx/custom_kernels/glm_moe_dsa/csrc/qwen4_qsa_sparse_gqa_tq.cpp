@@ -31,6 +31,32 @@ std::string tq_binary_dir() {
 
 bool last_dim_contiguous(const array &arr) { return arr.strides(-1) == 1; }
 
+// MSE bit width from a codebook's entry count: exact log2 for the
+// instantiated widths {2, 3, 4, 6, 8}; -1 rejects everything else.
+int codebook_bits(const array &cb) {
+  if (cb.ndim() != 1) {
+    return -1;
+  }
+  const size_t n = cb.shape(0);
+  if (n < 4 || n > 256 || (n & (n - 1)) != 0) {
+    return -1;
+  }
+  int bits = 0;
+  while ((size_t(1) << bits) < n) {
+    ++bits;
+  }
+  switch (bits) {
+  case 2:
+  case 3:
+  case 4:
+  case 6:
+  case 8:
+    return bits;
+  default:
+    return -1;
+  }
+}
+
 // Must match Qwen4QSATQParams in the shared Steel params header exactly.
 struct Qwen4QSATQParams {
   int B;
@@ -55,10 +81,10 @@ struct Qwen4QSATQParams {
 
 class Qwen4QSATQPrimitive : public Primitive {
 public:
-  Qwen4QSATQPrimitive(Stream stream, float scale, int q_offset, int key_tile,
-                      int dimension_tile)
-      : Primitive(stream), scale_(scale), q_offset_(q_offset),
-        key_tile_(key_tile), dimension_tile_(dimension_tile) {}
+  Qwen4QSATQPrimitive(Stream stream, float scale, int q_offset, int bits_k,
+                      int bits_v, int key_tile, int dimension_tile)
+      : Primitive(stream), scale_(scale), q_offset_(q_offset), bits_k_(bits_k),
+        bits_v_(bits_v), key_tile_(key_tile), dimension_tile_(dimension_tile) {}
 
   static bool unsupported(const array &q, const array &kn, const array &kp,
                           const array &vn, const array &vp, const array &cbk,
@@ -70,11 +96,17 @@ public:
     if (q.dtype() != float16 && q.dtype() != bfloat16) {
       return true;
     }
-    // 4-bit MSE only: fp16 norms over [B, H, T], uint32 packed words over
-    // [B, H, T, D/8], and 16-entry fp32 codebooks.
+    // MSE widths {2,3,4,6,8} per side: fp16 norms over [B, H, T], uint32
+    // packed words over [B, H, T, 256*bits/32], and 2^bits-entry fp32
+    // codebooks (the bit widths are inferred from the codebook sizes).
     if (kn.dtype() != float16 || vn.dtype() != float16 ||
         kp.dtype() != uint32 || vp.dtype() != uint32 ||
         cbk.dtype() != float32 || cbv.dtype() != float32) {
+      return true;
+    }
+    const int bits_k = codebook_bits(cbk);
+    const int bits_v = codebook_bits(cbv);
+    if (bits_k < 0 || bits_v < 0) {
       return true;
     }
     if (q.ndim() != 4 || kn.ndim() != 3 || kp.ndim() != 4 || vn.ndim() != 3 ||
@@ -97,11 +129,10 @@ public:
         vp.shape(0) != 1 || vp.shape(1) != 2) {
       return true;
     }
+    // D=256 is enforced by the query shape check above.
     if (kn.shape(2) != vn.shape(2) || kp.shape(2) != vp.shape(2) ||
-        kn.shape(2) != kp.shape(2) || kp.shape(3) != 32 || vp.shape(3) != 32) {
-      return true;
-    }
-    if (cbk.shape(0) != 16 || cbv.shape(0) != 16) {
+        kn.shape(2) != kp.shape(2) || kp.shape(3) != 256 * bits_k / 32 ||
+        vp.shape(3) != 256 * bits_v / 32) {
       return true;
     }
     if (selected.shape(0) != 1 || selected.shape(1) != 1 ||
@@ -111,8 +142,10 @@ public:
     if (q_offset < 0 || q_offset + q.shape(2) > kn.shape(2)) {
       return true;
     }
+    // The (128,32) tuning variant is instantiated for the 4-bit pair only.
     if (!((key_tile == 64 && dimension_tile == 64) ||
-          (key_tile == 128 && dimension_tile == 32))) {
+          (key_tile == 128 && dimension_tile == 32 && bits_k == 4 &&
+           bits_v == 4))) {
       return true;
     }
     return false;
@@ -167,8 +200,9 @@ public:
 
     std::string kernel_name;
     concatenate(kernel_name, "qwen4_qsa_sparse_gqa_tq_", type_to_name(q),
-                "_bk", key_tile_, "_dc", dimension_tile_, "_gqa", gqa, "_hp",
-                hpad, "_d", dim, "_wm", wm);
+                "_kb", bits_k_, "_vb", bits_v_, "_bk", key_tile_, "_dc",
+                dimension_tile_, "_gqa", gqa, "_hp", hpad, "_d", dim, "_wm",
+                wm);
 
     auto library = device.get_library("omlx_glm_kernels", tq_binary_dir());
     auto kernel = device.get_kernel(kernel_name, library);
@@ -193,16 +227,20 @@ public:
   bool is_equivalent(const Primitive &other) const override {
     const auto &rhs = static_cast<const Qwen4QSATQPrimitive &>(other);
     return scale_ == rhs.scale_ && q_offset_ == rhs.q_offset_ &&
-           key_tile_ == rhs.key_tile_ && dimension_tile_ == rhs.dimension_tile_;
+           bits_k_ == rhs.bits_k_ && bits_v_ == rhs.bits_v_ &&
+           key_tile_ == rhs.key_tile_ &&
+           dimension_tile_ == rhs.dimension_tile_;
   }
   auto state() const {
-    return std::make_tuple(nullptr, scale_, q_offset_, key_tile_,
-                           dimension_tile_);
+    return std::make_tuple(nullptr, scale_, q_offset_, bits_k_, bits_v_,
+                           key_tile_, dimension_tile_);
   }
 
 private:
   float scale_;
   int q_offset_;
+  int bits_k_;
+  int bits_v_;
   int key_tile_;
   int dimension_tile_;
 };
@@ -222,20 +260,24 @@ array qwen4_qsa_sparse_gqa_attention_tq(
                                        key_tile, dimension_tile, stream)) {
     std::ostringstream msg;
     msg << "[omlx_glm_kernels.qwen4_qsa_sparse_gqa_attention_tq] expected "
-        << "q=[1,24,M,256] fp16/bf16, norms=[1,2,T] fp16, packed=[1,2,T,32] "
-        << "uint32, codebooks=[16] fp32, uint32 selected blocks=[1,1,M,512], "
-        << "q_offset>=0, (BK,DC) in {(64,64),(128,32)}; got "
+        << "q=[1,24,M,256] fp16/bf16, norms=[1,2,T] fp16, packed "
+        << "[1,2,T,256*bits/32] uint32, codebooks=[2^bits] fp32 with bits in "
+        << "{2,3,4,6,8} per side, uint32 selected blocks=[1,1,M,512], "
+        << "q_offset>=0, (BK,DC)=(64,64) or (128,32) at 4 bits; got "
         << queries.shape() << ", " << key_norms.shape() << ", "
         << key_packed.shape() << ", " << selected_blocks.shape() << ".";
     throw std::invalid_argument(msg.str());
   }
+  // Validated by unsupported(): both codebooks carry instantiated widths.
+  const int bits_k = codebook_bits(codebook_k);
+  const int bits_v = codebook_bits(codebook_v);
 
   Shape out_shape{queries.shape(0), queries.shape(1), queries.shape(2),
                   queries.shape(3)};
   return array(
       std::move(out_shape), float32,
-      std::make_shared<Qwen4QSATQPrimitive>(stream, scale, q_offset, key_tile,
-                                            dimension_tile),
+      std::make_shared<Qwen4QSATQPrimitive>(stream, scale, q_offset, bits_k,
+                                            bits_v, key_tile, dimension_tile),
       std::vector<array>{queries, key_norms, key_packed, value_norms,
                          value_packed, codebook_k, codebook_v,
                          selected_blocks});

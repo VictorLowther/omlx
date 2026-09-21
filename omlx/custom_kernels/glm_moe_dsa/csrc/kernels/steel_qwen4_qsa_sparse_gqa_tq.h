@@ -7,14 +7,83 @@
 #include "mlx/backend/metal/kernels/steel/attn/params.h"
 #include "steel_qwen4_qsa_sparse_gqa.h"
 
-// Exact Qwen4 QSA main attention over TurboQuant 4-bit MSE-packed K/V.
+// Packed-slot geometry for MSE bitstreams: rows pack `bits`-wide fields
+// LSB-first across uint32 words, and a slot of 32/gcd(bits,32) dims spans
+// exactly slot*bits/32 whole words, so slot loads stay word-aligned and
+// every field offset is a compile-time constant.
+constexpr int tq_gcd(int a, int b) { return b == 0 ? a : tq_gcd(b, a % b); }
+
+template <int BITS>
+constexpr int tq_slot_dims() {
+  return 32 / tq_gcd(BITS, 32);
+}
+
+template <int BITS>
+constexpr int tq_slot_words() {
+  return tq_slot_dims<BITS>() * BITS / 32;
+}
+
+// Field J of one packed slot held in w0..w2 (words past the slot's own stay
+// zero and are never selected: a slot spans at most three words).
+template <int BITS, int J>
+METAL_FUNC uint32_t tq_field(uint32_t w0, uint32_t w1, uint32_t w2) {
+  constexpr int P = BITS * J;
+  constexpr int A = P >> 5;
+  constexpr int S = P & 31;
+  constexpr uint32_t M = (uint32_t(1) << BITS) - 1u;
+  if constexpr (A == 0) {
+    if constexpr (S + BITS <= 32) {
+      return (w0 >> S) & M;
+    } else {
+      return ((w0 >> S) | (w1 << (32 - S))) & M;
+    }
+  } else if constexpr (A == 1) {
+    if constexpr (S + BITS <= 32) {
+      return (w1 >> S) & M;
+    } else {
+      return ((w1 >> S) | (w2 << (32 - S))) & M;
+    }
+  } else {
+    static_assert(A == 2 && S + BITS <= 32,
+                  "slot field escapes the third word");
+    return (w2 >> S) & M;
+  }
+}
+
+// Compile-time-recursed scatters of one unpacked slot. K staging is
+// transposed (element j of row k lands at KVs[k + (d+j)*ld]); V staging is
+// row-major with the token norm folded in.
+template <int BITS, int SLOT_DIMS, int J, typename T>
+METAL_FUNC void tq_scatter_k(uint32_t w0, uint32_t w1, uint32_t w2,
+                             const threadgroup float* cb, threadgroup T* dst,
+                             int row, int ld, int d) {
+  if constexpr (J < SLOT_DIMS) {
+    dst[row + (d + J) * ld] = T(cb[tq_field<BITS, J>(w0, w1, w2)]);
+    tq_scatter_k<BITS, SLOT_DIMS, J + 1, T>(w0, w1, w2, cb, dst, row, ld, d);
+  }
+}
+
+template <int BITS, int SLOT_DIMS, int J, typename T>
+METAL_FUNC void tq_scatter_v(uint32_t w0, uint32_t w1, uint32_t w2,
+                             const threadgroup float* cb, float vn,
+                             threadgroup T* dst, int base, int d) {
+  if constexpr (J < SLOT_DIMS) {
+    dst[base + d + J] = T(cb[tq_field<BITS, J>(w0, w1, w2)] * vn);
+    tq_scatter_v<BITS, SLOT_DIMS, J + 1, T>(w0, w1, w2, cb, vn, dst, base, d);
+  }
+}
+
+// Exact Qwen4 QSA main attention over TurboQuant MSE-packed K/V at any
+// instantiated bit width (BITS_K/BITS_V independently from {2, 3, 4, 6, 8}).
 //
 // Clone of qwen4_qsa_sparse_gqa_attention with the dense K/V row staging
-// replaced by in-threadgroup MSE unpacking. At 4 bits and D=256 one packed
-// uint32 word holds exactly one 8-dimension uint4 staging slot (LSB-first
-// nibbles, matching _gen_unrolled_extract's fast path), so the staging loop
-// keeps the dense kernel's access pattern: load one word, look up the
-// 16-entry codebook held in threadgroup memory, scatter eight elements.
+// replaced by in-threadgroup MSE unpacking (LSB-first `bits`-wide fields,
+// matching _gen_unrolled_extract's layout). A slot of 32/gcd(bits,32) dims
+// spans exactly slot*bits/32 whole uint32 words — one word per 8 dims at
+// 4 bits, three words per 16 dims at 6 — so the staging loop keeps the
+// dense kernel's access pattern: load the slot's words, look up the
+// 2^bits-entry codebook held in threadgroup memory, scatter the slot's
+// elements at constant-folded offsets.
 //
 // Queries arrive pre-rotated into the key codec's RHT frame on the host, so
 // QK dots run directly against codebook values; the per-token fp16 key norm
@@ -28,6 +97,8 @@
 // carry explicit (B, H[, T]) strides instead of deriving them from kL.
 template <
     typename T,
+    int BITS_K,
+    int BITS_V,
     int BK,
     int DC,
     int GQA,
@@ -74,6 +145,20 @@ qwen4_qsa_sparse_gqa_attention_tq(
   static_assert(BK % kFragSize == 0, "BK must be a multiple of eight.");
   static_assert(DC % kFragSize == 0, "DC must be a multiple of eight.");
   static_assert(D % DC == 0, "Head dimension must divide DC.");
+  constexpr int kCbK = 1 << BITS_K;
+  constexpr int kCbV = 1 << BITS_V;
+  constexpr int kSlotK = tq_slot_dims<BITS_K>();
+  constexpr int kWordsK = tq_slot_words<BITS_K>();
+  constexpr int kSlotV = tq_slot_dims<BITS_V>();
+  constexpr int kWordsV = tq_slot_words<BITS_V>();
+  constexpr int kSlotsK = DC / kSlotK;
+  constexpr int kSlotsV = DC / kSlotV;
+  static_assert(kWordsK <= 3 && kWordsV <= 3,
+                "One packed slot must fit three uint32 words.");
+  static_assert(DC % kSlotK == 0 && DC % kSlotV == 0,
+                "Dimension chunk must hold whole packed slots.");
+  static_assert((DC * BITS_K) % 32 == 0 && (DC * BITS_V) % 32 == 0,
+                "Dimension chunks must start on a packed-word boundary.");
 
   constexpr int tgp_size = WM * 32;
   const int lane = int(simd_group_id * 32 + simd_lane_id);
@@ -86,13 +171,15 @@ qwen4_qsa_sparse_gqa_attention_tq(
   threadgroup int selected[BK];
   threadgroup float sel_kn[BK];
   threadgroup float sel_vn[BK];
-  threadgroup float cbk_t[16];
-  threadgroup float cbv_t[16];
+  threadgroup float cbk_t[kCbK];
+  threadgroup float cbv_t[kCbV];
 
-  // One-time 4-bit codebook preload (16 entries each).
-  if (lane < 16) {
-    cbk_t[lane] = CBK[lane];
-    cbv_t[lane] = CBV[lane];
+  // One-time codebook preload (2^bits entries per side).
+  for (int i = lane; i < kCbK; i += tgp_size) {
+    cbk_t[i] = CBK[i];
+  }
+  for (int i = lane; i < kCbV; i += tgp_size) {
+    cbv_t[i] = CBV[i];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -192,23 +279,24 @@ qwen4_qsa_sparse_gqa_attention_tq(
         }
         *((threadgroup uint4 *)(Qs + h * LDQ) + d8) = word;
       }
-      // Unpack K rows: one packed word per eight-dimension staging slot,
-      // transposed scatter identical to the dense kernel's uint4 decode.
-      for (int elem = lane; elem < BK * (DC / 8); elem += tgp_size) {
-        const int k = elem / (DC / 8);
-        const int d8 = elem - k * (DC / 8);
+      // Unpack K rows: one packed slot of kSlotK dims per kWordsK word(s),
+      // transposed scatter identical to the dense kernel's access pattern.
+      for (int elem = lane; elem < BK * kSlotsK; elem += tgp_size) {
+        const int k = elem / kSlotsK;
+        const int slot = elem - k * kSlotsK;
         const int k_pos = selected[k];
-        uint32_t word = 0u;
+        uint32_t words[3] = {0u, 0u, 0u};
         if (k_pos >= 0) {
-          word = k_pk[size_t(k_pos) * size_t(kp_tstride) +
-                      size_t(dbase >> 3) + d8];
+          const device uint32_t* src =
+              k_pk + size_t(k_pos) * size_t(kp_tstride) +
+              size_t(dbase * BITS_K / 32) + size_t(slot * kWordsK);
+          STEEL_PRAGMA_UNROLL
+          for (int w = 0; w < kWordsK; ++w) {
+            words[w] = src[w];
+          }
         }
-        const int d = d8 * 8;
-        STEEL_PRAGMA_UNROLL
-        for (short e = 0; e < 8; ++e) {
-          const uint32_t nib = (word >> (4 * uint32_t(e))) & 0xFu;
-          KVs[k + (d + e) * LDK] = T(cbk_t[nib]);
-        }
+        tq_scatter_k<BITS_K, kSlotK, 0, T>(words[0], words[1], words[2], cbk_t,
+                                           KVs, k, LDK, slot * kSlotK);
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
       STEEL_PRAGMA_UNROLL
@@ -275,22 +363,23 @@ qwen4_qsa_sparse_gqa_attention_tq(
       const int dbase = int(vchunk) * DC;
       // Unpack V rows with the token norm folded in; the accumulator stays
       // in the value codec's rotated frame for the host-side inverse RHT.
-      for (int elem = lane; elem < BK * (DC / 8); elem += tgp_size) {
-        const int k = elem / (DC / 8);
-        const int d8 = elem - k * (DC / 8);
+      for (int elem = lane; elem < BK * kSlotsV; elem += tgp_size) {
+        const int k = elem / kSlotsV;
+        const int slot = elem - k * kSlotsV;
         const int k_pos = selected[k];
-        uint32_t word = 0u;
+        uint32_t words[3] = {0u, 0u, 0u};
         if (k_pos >= 0) {
-          word = v_pk[size_t(k_pos) * size_t(vp_tstride) +
-                      size_t(dbase >> 3) + d8];
+          const device uint32_t* src =
+              v_pk + size_t(k_pos) * size_t(vp_tstride) +
+              size_t(dbase * BITS_V / 32) + size_t(slot * kWordsV);
+          STEEL_PRAGMA_UNROLL
+          for (int w = 0; w < kWordsV; ++w) {
+            words[w] = src[w];
+          }
         }
-        const float vn = sel_vn[k];
-        const int d = d8 * 8;
-        STEEL_PRAGMA_UNROLL
-        for (short e = 0; e < 8; ++e) {
-          const uint32_t nib = (word >> (4 * uint32_t(e))) & 0xFu;
-          KVs[k * LDV + d + e] = T(cbv_t[nib] * vn);
-        }
+        tq_scatter_v<BITS_V, kSlotV, 0, T>(words[0], words[1], words[2], cbv_t,
+                                           sel_vn[k], KVs, k * LDV,
+                                           slot * kSlotV);
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
       STEEL_PRAGMA_UNROLL

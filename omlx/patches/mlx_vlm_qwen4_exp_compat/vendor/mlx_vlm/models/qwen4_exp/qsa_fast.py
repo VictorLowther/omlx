@@ -29,6 +29,32 @@ _NATIVE_QSA_MAIN_PROVEN = False
 _NATIVE_QSA_TQ_DISABLED = False
 _NATIVE_QSA_TQ_PROVEN = False
 
+# Codec-bit pairs with native packed-row kernel instantiations. Fractional
+# cache widths quantize at floor/ceil codec bits (2.5 -> (2, 3), 3.5 ->
+# (3, 4)); every other supported width uses one integer pair.
+_TQ_NATIVE_BIT_PAIRS = frozenset(
+    {(2, 2), (2, 3), (3, 3), (3, 4), (4, 4), (6, 6), (8, 8)}
+)
+
+
+def _tq_native_bit_pair(bits: float) -> tuple[int, int] | None:
+    """Codec-bit pair a TurboQuant width quantizes at; None if not numeric.
+
+    Mirrors mlx_vlm.turboquant's split rule: widths that round to an integer
+    (within 1e-6) use one codec pair; genuinely fractional widths split into
+    floor/ceil codec bits.
+    """
+    try:
+        b = float(bits)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(b) or b < 1:
+        return None
+    if math.isclose(b, round(b), abs_tol=1e-6):
+        i = int(round(b))
+        return (i, i)
+    return int(math.floor(b)), int(math.ceil(b))
+
 
 def _nax_gpu() -> bool:
     try:
@@ -352,15 +378,25 @@ def _native_sparse_gqa_attention(
         return None
 
 
-def native_qsa_tq_available() -> bool:
+def native_qsa_tq_available(bits: float | None = None) -> bool:
     """True when the packed-row native GQA kernel can dispatch.
 
     The prefill eligibility gate consults this: the portable union-gather
     arm is only competitive inside a measured context band, but the native
     packed-row kernel runs at the dense arm's rate at any context, so the
     band's ceiling must not push native-eligible shapes onto the mask path.
+
+    With ``bits`` (a cache's TurboQuant width), additionally require that
+    the width's codec-bit pair has kernel instantiations — lifting the
+    ceiling for a width that would bail to the portable arm would strand
+    the prefill above the measured band.
     """
     if _NATIVE_QSA_TQ_DISABLED:
+        return False
+    if (
+        bits is not None
+        and _tq_native_bit_pair(bits) not in _TQ_NATIVE_BIT_PAIRS
+    ):
         return False
     try:
         from omlx.custom_kernels.glm_moe_dsa import fast
@@ -383,11 +419,13 @@ def _native_sparse_gqa_attention_tq(
 ) -> mx.array | None:
     """Consume TurboQuant-packed rows directly in the native GQA kernel.
 
-    4-bit MSE codecs only (the kernel unpacks LSB-first nibbles against
-    the 16-entry codebooks). Queries are rotated into the key codec's
-    frame on the host; the fp32 output returns in the value codec's
-    rotated frame and is inverse-rotated here, so the calling arm sees
-    exactly the dense native kernel's contract.
+    MSE codecs at instantiated bit widths only — see _TQ_NATIVE_BIT_PAIRS
+    (the kernel unpacks LSB-first ``bits``-wide fields against 2^bits-entry
+    codebooks; fractional cache widths ride their floor/ceil codec pair).
+    Queries are rotated into the key codec's RHT frame on the host; the
+    fp32 output returns in the value codec's rotated frame and is
+    inverse-rotated here, so the calling arm sees exactly the dense native
+    kernel's contract.
     """
 
     global _NATIVE_QSA_TQ_DISABLED, _NATIVE_QSA_TQ_PROVEN
@@ -406,8 +444,20 @@ def _native_sparse_gqa_attention_tq(
     value_codec = getattr(cache, "value_codec", None)
     if key_codec is None or value_codec is None:
         return None
-    if int(key_codec.bits) != 4 or int(value_codec.bits) != 4:
+    key_bits = getattr(key_codec, "bits", None)
+    value_bits = getattr(value_codec, "bits", None)
+    if (
+        key_bits is None
+        or value_bits is None
+        or int(key_bits) != key_bits
+        or int(value_bits) != value_bits
+        or (int(key_bits), int(value_bits)) not in _TQ_NATIVE_BIT_PAIRS
+    ):
         return None
+    # D=256 is enforced by the query-shape gate below; a packed row carries
+    # 256*bits/32 = 8*bits uint32 words.
+    expected_k_words = 8 * int(key_bits)
+    expected_v_words = 8 * int(value_bits)
     if (
         queries.ndim != 4
         or queries.shape[0] != 1
@@ -419,8 +469,8 @@ def _native_sparse_gqa_attention_tq(
         or q_offset < 0
         or q_offset + queries.shape[2] > ks.norms.shape[2]
         or queries.shape[2] < _native_main_min_rows()
-        or ks.indices.shape[-1] != 32
-        or vs.indices.shape[-1] != 32
+        or ks.indices.shape[-1] != expected_k_words
+        or vs.indices.shape[-1] != expected_v_words
         or ks.norms.dtype != mx.float16
         or ks.indices.dtype != mx.uint32
     ):

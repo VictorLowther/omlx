@@ -517,7 +517,8 @@ def test_layer_scanner_detects_qsa_payload():
 # ---------------------------------------------------------------------------
 
 
-def test_gathered_prefill_kernel_parity_within_codec_tolerance():
+@pytest.mark.parametrize("bits", [4, 6])
+def test_gathered_prefill_kernel_parity_within_codec_tolerance(bits):
     """TQ prefill kernel == dense kernel on identical selection inputs.
 
     Kernel-level with synthetic arrays and identity indexer norm/rope: no
@@ -568,7 +569,7 @@ def test_gathered_prefill_kernel_parity_within_codec_tolerance():
 
     dense_cache = QSAKVCache()
     dense_cache.state = (keys, values, ik, ip)
-    hybrid = TurboQuantQSAKVCache.from_qsa_cache(dense_cache, bits=BITS)
+    hybrid = TurboQuantQSAKVCache.from_qsa_cache(dense_cache, bits=bits)
 
     kwargs = {
         "num_query_heads": heads,
@@ -595,6 +596,220 @@ def test_gathered_prefill_kernel_parity_within_codec_tolerance():
         mx.linalg.norm(out_tq - out_dense) / mx.maximum(mx.linalg.norm(out_dense), 1e-6)
     )
     assert rel < 0.15, f"relative L2 {rel:.3f} exceeds codec-scale drift"
+
+
+@pytest.mark.parametrize("bits", [4, 6])
+def test_gathered_decode_kernel_parity_within_codec_tolerance(bits):
+    """TQ decode arm == dense decode arm on identical selection inputs.
+
+    Kernel-level with synthetic arrays and identity indexer norm/rope: no
+    module forwards, so back-to-back parametrized runs stay immune to the
+    lazy-mutation hazard that corrupts repeated module-forward sequences
+    in one process (which is why the module-level decode test above may
+    run exactly one numeric comparison per process).
+    """
+    from mlx_vlm.models.qwen4_exp.qsa_fast import (
+        contiguous_causal_gathered_qsa_decode,
+        contiguous_causal_gathered_qsa_decode_tq,
+        pool_completed_index_keys,
+    )
+
+    rng = _rng(31)
+    heads, dim, idx_dim = 2, HEAD_DIM, IDX_DIM
+    ratio, budget = 2, 8
+    # max_blocks=16 > block_budget=4: sparse selection engages
+    n_tokens = 32
+    keys = mx.array(
+        rng.standard_normal((1, KV_HEADS, n_tokens, dim)).astype(np.float32)
+    )
+    values = mx.array(
+        rng.standard_normal((1, KV_HEADS, n_tokens, dim)).astype(np.float32)
+    )
+    queries = mx.array(rng.standard_normal((1, heads, 1, dim)).astype(np.float32))
+    index_queries = mx.array(rng.standard_normal((1, 1, 2, idx_dim)).astype(np.float32))
+    ik = mx.array(rng.standard_normal((1, n_tokens, idx_dim)).astype(np.float32))
+    ip = mx.arange(n_tokens, dtype=mx.int32)[None, :]
+
+    def ident_norm(x):
+        return x
+
+    def ident_rope(x, positions):
+        return x
+
+    pooled = pool_completed_index_keys(
+        ik,
+        ip,
+        compress_ratio=ratio,
+        index_key_norm=ident_norm,
+        apply_index_rope=ident_rope,
+    )
+
+    dense_cache = QSAKVCache()
+    dense_cache.state = (keys, values, ik, ip)
+    hybrid = TurboQuantQSAKVCache.from_qsa_cache(dense_cache, bits=bits)
+
+    kwargs = {
+        "num_query_heads": heads,
+        "num_key_value_heads": KV_HEADS,
+        "head_dim": dim,
+        "indexer_head_dim": idx_dim,
+        "compress_ratio": ratio,
+        "token_budget": budget,
+    }
+    out_dense = contiguous_causal_gathered_qsa_decode(
+        queries, keys, values, index_queries, pooled, **kwargs
+    )
+    out_tq = contiguous_causal_gathered_qsa_decode_tq(
+        queries, hybrid, index_queries, pooled, **kwargs
+    )
+
+    assert out_tq.shape == out_dense.shape
+    assert mx.isfinite(out_tq).all().item()
+    assert _cosine(out_dense, out_tq) > 0.95
+    rel = float(
+        mx.linalg.norm(out_tq - out_dense) / mx.maximum(mx.linalg.norm(out_dense), 1e-6)
+    )
+    # The decode gather attends only budget + ratio - 1 rows (~11 here), so
+    # 4-bit codec noise averages out less than in the prefill parity test
+    # (measured rel-L2 0.164 at 4 bits, well under it at 6).
+    assert rel < 0.25, f"relative L2 {rel:.3f} exceeds codec-scale drift"
+
+
+# ---------------------------------------------------------------------------
+# Native packed-row kernel: per-width numeric parity
+# ---------------------------------------------------------------------------
+
+NATIVE_Q_HEADS = 24
+NATIVE_KV_HEADS = 2
+NATIVE_DIM = 256
+NATIVE_TOKENS = 512
+NATIVE_ROWS = 32  # must be >= _native_main_min_rows() (default 24)
+
+# Both arms consume the identical selection; the dense arm sees the
+# dequantized rows, so any residual divergence is in-kernel rounding only
+# (fp16/bf16 staging, norm fold points, log2-domain softmax) — no codec
+# noise. Tolerances calibrated against the 4-bit kernel's measured rel-L2.
+_NATIVE_TOL = {
+    mx.float16: dict(cos=0.999, rel=2e-2),
+    mx.bfloat16: dict(cos=0.999, rel=5e-2),
+}
+
+
+def _native_qsa_symbols_available() -> bool:
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    try:
+        return bool(
+            fast.is_native_available()
+            and fast.has_symbol("qwen4_qsa_sparse_gqa_attention_tq")
+            and fast.has_symbol("qwen4_qsa_sparse_gqa_attention")
+        )
+    except Exception:
+        return False
+
+
+requires_native_qsa = pytest.mark.skipif(
+    not _native_qsa_symbols_available(),
+    reason="native QSA kernel extension is not built",
+)
+
+
+def _native_parity_case(bits: float, dtype: mx.Dtype):
+    """TQ native arm vs dense native arm on an identical selection."""
+    from mlx_vlm.models.qwen4_exp import qsa_fast as qf
+
+    rng = _rng(2400 + int(bits * 2))
+    n_tokens, n_rows = NATIVE_TOKENS, NATIVE_ROWS
+    q_offset = n_tokens - n_rows
+    keys = mx.array(
+        rng.standard_normal((1, NATIVE_KV_HEADS, n_tokens, NATIVE_DIM)).astype(
+            np.float32
+        )
+    )
+    values = mx.array(
+        rng.standard_normal((1, NATIVE_KV_HEADS, n_tokens, NATIVE_DIM)).astype(
+            np.float32
+        )
+    )
+    queries = mx.array(
+        rng.standard_normal((1, NATIVE_Q_HEADS, n_rows, NATIVE_DIM)).astype(np.float32)
+    ).astype(dtype)
+
+    hybrid = TurboQuantQSAKVCache(bits=bits)
+    hybrid.update_and_fetch(keys, values)
+
+    # Chronological block IDs; blocks beyond the causal horizon expand to
+    # candidates >= kL and are masked identically in both kernels.
+    selected = mx.broadcast_to(
+        mx.arange(512, dtype=mx.uint32).reshape(1, 1, 512), (1, n_rows, 512)
+    )
+
+    dk, dv = hybrid.dequantize()
+    ref = qf._native_sparse_gqa_attention(
+        queries, dk.astype(dtype), dv.astype(dtype), selected, q_offset=q_offset
+    )
+    out = qf._native_sparse_gqa_attention_tq(
+        queries, hybrid, selected, q_offset=q_offset
+    )
+    assert ref is not None, "dense native reference arm unavailable"
+    assert out is not None, f"native TQ arm rejected bits={bits}"
+
+    a = out.astype(mx.float32)
+    b = ref.astype(mx.float32)
+    tol = _NATIVE_TOL[dtype]
+    cos = _cosine(a, b)
+    rel = float(mx.linalg.norm(a - b) / mx.maximum(mx.linalg.norm(b), 1e-6))
+    assert cos > tol["cos"], f"bits={bits} cosine {cos:.6f} below {tol['cos']}"
+    assert rel < tol["rel"], f"bits={bits} rel L2 {rel:.4f} exceeds {tol['rel']}"
+
+
+@requires_native_qsa
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("bits", [2, 2.5, 3, 3.5, 4, 6, 8])
+def test_native_tq_kernel_matches_dense_per_width(bits, dtype):
+    _native_parity_case(bits, dtype)
+
+
+@requires_native_qsa
+@pytest.mark.parametrize("bits", [5, 7])
+def test_native_tq_arm_fails_closed_on_uninstantiated_widths(bits):
+    """Valid TurboQuant widths with no native instantiation must not dispatch."""
+    from mlx_vlm.models.qwen4_exp import qsa_fast as qf
+
+    rng = _rng(77)
+    n_tokens, n_rows = 256, NATIVE_ROWS
+    keys = mx.array(
+        rng.standard_normal((1, NATIVE_KV_HEADS, n_tokens, NATIVE_DIM)).astype(
+            np.float32
+        )
+    )
+    values = mx.array(
+        rng.standard_normal((1, NATIVE_KV_HEADS, n_tokens, NATIVE_DIM)).astype(
+            np.float32
+        )
+    )
+    queries = mx.array(
+        rng.standard_normal((1, NATIVE_Q_HEADS, n_rows, NATIVE_DIM)).astype(np.float32)
+    ).astype(mx.float16)
+    hybrid = TurboQuantQSAKVCache(bits=bits)
+    hybrid.update_and_fetch(keys, values)
+    selected = mx.broadcast_to(
+        mx.arange(512, dtype=mx.uint32).reshape(1, 1, 512), (1, n_rows, 512)
+    )
+    out = qf._native_sparse_gqa_attention_tq(
+        queries, hybrid, selected, q_offset=n_tokens - n_rows
+    )
+    assert out is None
+
+
+def test_native_qsa_tq_available_is_bits_aware():
+    from mlx_vlm.models.qwen4_exp.qsa_fast import native_qsa_tq_available
+
+    symbol_only = native_qsa_tq_available()
+    for bits in (2, 2.5, 3, 3.5, 4, 6, 8):
+        assert native_qsa_tq_available(bits) == symbol_only, bits
+    for bits in (1, 4.5, 5, 6.5, 7, 16):
+        assert native_qsa_tq_available(bits) is False, bits
 
 
 def test_gathered_prefill_eligible_and_wired_on_hybrid(monkeypatch):
@@ -634,7 +849,11 @@ def test_gathered_prefill_eligible_and_wired_on_hybrid(monkeypatch):
     )
 
     # Above the band the tiled mask route takes over (750k ladder stall);
-    # a 0 ceiling disables the cap.
+    # a 0 ceiling disables the cap. Pin the native-symbol probe so these
+    # assertions hold on boxes with and without the built extension.
+    import mlx_vlm.models.qwen4_exp.language as lang
+
+    monkeypatch.setattr(lang, "native_qsa_tq_available", lambda *args: False)
     monkeypatch.setenv("OMLX_QWEN4_TQ_PREFILL_MAX_CONTEXT", "16")
     assert not attn._gathered_text_prefill_eligible(
         x, None, hybrid_cache, positions, None, False
@@ -642,13 +861,11 @@ def test_gathered_prefill_eligible_and_wired_on_hybrid(monkeypatch):
 
     # The native packed-row kernel lifts the ceiling (dense-class rate at
     # any context); boxes without the symbol keep the measured band.
-    import mlx_vlm.models.qwen4_exp.language as lang
-
-    monkeypatch.setattr(lang, "native_qsa_tq_available", lambda: True)
+    monkeypatch.setattr(lang, "native_qsa_tq_available", lambda *args: True)
     assert attn._gathered_text_prefill_eligible(
         x, None, hybrid_cache, positions, None, False
     )
-    monkeypatch.setattr(lang, "native_qsa_tq_available", lambda: False)
+    monkeypatch.setattr(lang, "native_qsa_tq_available", lambda *args: False)
     monkeypatch.setenv("OMLX_QWEN4_TQ_PREFILL_MAX_CONTEXT", "0")
     assert attn._gathered_text_prefill_eligible(
         x, None, hybrid_cache, positions, None, False
@@ -1028,8 +1245,65 @@ def test_batch_trim_keeps_sidecar_aligned():
     assert mx.array_equal(out.index_keys, row.index_keys[:, :4]).item()
 
 
-def test_batch_extend_falls_back_dense(monkeypatch):
+def test_batch_trim_rewinds_packed_rows_like_dense(monkeypatch):
+    """B>1 MTP rollback trim must match the dense parent, scalar in/out.
 
+    _trim_append_caches rewinds a uniform-acceptance verify block with a
+    scalar trim(n). The packed B>1 batch keeps per-row array offsets plus
+    the shared _phys_end cursor, and the inherited singleton trim dies on
+    min(array, int) — the late-join crash that kept concurrent TQ-QSA
+    requests serialized at admission.
+    """
+    from mlx_vlm.models.qwen4_exp.language import (
+        BatchQSAKVCache,
+        BatchTurboQuantQSAKVCache,
+    )
+
+    from omlx.turboquant_kv import BatchTurboQuantKVCache
+
+    monkeypatch.setenv("OMLX_TQ_QSA_BATCH_ROWS", "1")
+    row_a, row_b = _hybrid_rows((4, 6))
+    dense_a = row_a._to_dense_singleton()
+    dense_b = row_b._to_dense_singleton()
+    packed = BatchTurboQuantQSAKVCache.merge([row_a, row_b])
+    dense = BatchQSAKVCache.merge([dense_a, dense_b])
+    assert isinstance(packed.kv_cache, BatchTurboQuantKVCache)
+
+    rng = _rng(17)
+
+    def _step():
+        k = mx.array(rng.standard_normal((2, KV_HEADS, 1, HEAD_DIM)).astype(np.float32))
+        v = mx.array(rng.standard_normal((2, KV_HEADS, 1, HEAD_DIM)).astype(np.float32))
+        return k, v
+
+    k1, v1 = _step()
+    for batch in (packed, dense):
+        batch.kv_cache.update_and_fetch(k1, v1)
+    assert packed.kv_cache._phys_end == dense.kv_cache._idx == 7
+
+    # The rollback contract: scalar in, scalar out, uniform rewind.
+    assert packed.trim(1) == 1
+    assert dense.trim(1) == 1
+    assert mx.array_equal(packed.kv_cache.offset, dense.kv_cache.offset).item()
+    assert packed.kv_cache._phys_end == dense.kv_cache._idx == 6
+    assert packed.index_offset == dense.index_offset == 5
+
+    # The next append lands at the rewound end: the rolled-back column is
+    # overwritten and the retained prefix dequantizes at codec scale.
+    k2, v2 = _step()
+    for batch in (packed, dense):
+        batch.kv_cache.update_and_fetch(k2, v2)
+    assert packed.kv_cache._phys_end == dense.kv_cache._idx == 7
+    for idx in (0, 1):
+        p = packed.extract(idx)
+        d = dense.extract(idx)
+        assert p.offset == d.offset
+        kp, vp = p.dequantize()
+        assert _cosine(kp, d.keys) > 0.99
+        assert _cosine(vp, d.values) > 0.99
+
+
+def test_batch_extend_falls_back_dense(monkeypatch):
     from omlx.turboquant_kv import BatchTurboQuantKVCache
 
     monkeypatch.delenv("OMLX_TQ_QSA_BATCH_ROWS", raising=False)
@@ -1041,6 +1315,36 @@ def test_batch_extend_falls_back_dense(monkeypatch):
     assert not isinstance(b1.kv_cache, BatchTurboQuantKVCache)
     assert b1.index_keys.shape[0] == 2
     assert b1.index_offset == 5
+
+
+def test_batch_extend_joins_live_packed_batch(monkeypatch):
+    """A late prefill joining a live packed batch must not scalar-convert
+    the per-row offsets.
+
+    BatchQSAKVCache.extend's alignment check calls kv_cache.size(); the
+    inherited singleton size() returns self.offset, which is a per-row
+    array at B>1 — the ValueError that killed all four streams when a
+    fourth concurrent session extended the running generation batch.
+    """
+    from mlx_vlm.models.qwen4_exp.language import BatchTurboQuantQSAKVCache
+
+    from omlx.turboquant_kv import BatchTurboQuantKVCache
+
+    monkeypatch.setenv("OMLX_TQ_QSA_BATCH_ROWS", "1")
+    row_a, row_b = _hybrid_rows((3, 5))
+    live = BatchTurboQuantQSAKVCache.merge([row_a, row_b])
+    (row_c,) = _hybrid_rows((4,))
+    joiner = row_c.to_batch([0])
+
+    live.extend(joiner)
+
+    assert isinstance(live.kv_cache, BatchTurboQuantKVCache)
+    outs = [live.extract(i) for i in range(3)]
+    assert [o.offset for o in outs] == [3, 5, 4]
+    kc, _ = outs[2].dequantize()
+    kc0, _ = row_c.dequantize()
+    assert _cosine(kc, kc0) > 0.99
+    assert mx.array_equal(outs[2].index_keys, row_c.index_keys).item()
 
 
 def test_tq_qsa_serialized_decode_predicate(monkeypatch):
