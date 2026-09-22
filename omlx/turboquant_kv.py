@@ -140,6 +140,45 @@ def _concat_state_token_axis(states):
     return result
 
 
+def _concat_qsa_index_positions(parts):
+    """Concatenate per-block QSA indexer positions along the token axis.
+
+    Blocks capture ``index_position_ids`` at whatever rank the live cache
+    held: plain text stores ``(B, T)`` while an mRoPE-shaped capture stores
+    the same positions replicated across the three channels as ``(3, B, T)``.
+    Prefix chains dedup blocks stored at different times, so one chain can
+    mix both ranks — and ``mx.concatenate`` requires equal ndim, which
+    rejected the entire prefix hit and re-prefilled every request in the
+    lineage from scratch. Promote to the widest rank by replicating across
+    channels: that is what ``update_indexer`` does at runtime, and it is
+    lossless because text positions are identical across channels.
+    """
+    if not parts:
+        raise ValueError("cannot concatenate zero indexer-position blocks")
+    ndim = max(int(part.ndim) for part in parts)
+    promoted_count = sum(1 for part in parts if part.ndim < ndim)
+    if promoted_count:
+        # A mixed-rank chain is a store-side artifact, not a fault: the
+        # promotion below is lossless and mirrors what update_indexer does
+        # at runtime. Debug level because mixed chains are common enough
+        # that a warning would fire on most prefix restores.
+        logger.debug(
+            "QSA indexer positions: promoting %d of %d stored blocks to "
+            "rank %d (mRoPE channel replication) for concatenation",
+            promoted_count,
+            len(parts),
+            ndim,
+        )
+    channels = next((int(part.shape[0]) for part in parts if part.ndim == 3), 3)
+    promoted = [
+        mx.broadcast_to(part[None], (channels, *part.shape))
+        if part.ndim < ndim
+        else part
+        for part in parts
+    ]
+    return mx.concatenate(promoted, axis=-1)
+
+
 # ---------------------------------------------------------------------------
 # Batch-level state helpers (axis-0 operations)
 # ---------------------------------------------------------------------------

@@ -4168,12 +4168,15 @@ class BlockAwarePrefixCache(CacheManager):
                             TurboQuantQSAKVCache,
                         )
 
-                        from ..turboquant_kv import _concat_state_token_axis
+                        from ..turboquant_kv import (
+                            _concat_qsa_index_positions,
+                            _concat_state_token_axis,
+                        )
 
                         cat_ks = _concat_state_token_axis([p[0] for p in parts])
                         cat_vs = _concat_state_token_axis([p[1] for p in parts])
                         cat_ik = mx.concatenate([p[2] for p in parts], axis=1)
-                        cat_ip = mx.concatenate([p[3] for p in parts], axis=-1)
+                        cat_ip = _concat_qsa_index_positions([p[3] for p in parts])
                         hybrid = TurboQuantQSAKVCache(
                             bits=params_seen[0], seed=params_seen[1]
                         )

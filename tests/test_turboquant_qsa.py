@@ -512,6 +512,43 @@ def test_layer_scanner_detects_qsa_payload():
     assert BlockAwarePrefixCache._layer_has_tq_qsa_payload(tq_blocks, 0) is False
 
 
+def test_qsa_index_positions_concat_promotes_mixed_ranks():
+    """A dedup'd chain mixing position ranks must still reconstruct.
+
+    Blocks capture ``index_position_ids`` at whatever rank the live cache
+    held: plain text stores ``(B, T)`` while the mRoPE-shaped capture
+    stores the same positions replicated across the three channels as
+    ``(3, B, T)``. Block dedup chains blocks captured under different
+    ranks, and concatenating those raised a rank mismatch that rejected
+    the whole prefix hit — so every later request in the lineage
+    re-prefilled from scratch. Promotion replicates across channels,
+    exactly what ``update_indexer`` does at runtime, and is lossless
+    because text positions are channel-equal.
+    """
+    from omlx.turboquant_kv import _concat_qsa_index_positions
+
+    text_block = mx.arange(4, dtype=mx.int32).reshape(1, 4)
+    mrope_block = mx.broadcast_to(
+        mx.arange(4, 8, dtype=mx.int32).reshape(1, 1, 4), (3, 1, 4)
+    )
+    expected = mx.arange(8, dtype=mx.int32).reshape(1, 8)
+
+    cases = [
+        ([text_block, mrope_block], [0, 1, 2, 3, 4, 5, 6, 7]),
+        ([mrope_block, text_block], [4, 5, 6, 7, 0, 1, 2, 3]),
+    ]
+    for parts, tokens in cases:
+        out = _concat_qsa_index_positions(parts)
+        assert out.ndim == 3 and out.shape == (3, 1, 8)
+        for channel in range(3):
+            assert out[channel].tolist() == [tokens]
+
+    # A homogeneous rank-2 chain stays rank-2: no gratuitous promotion.
+    plain = _concat_qsa_index_positions([text_block, text_block])
+    assert plain.ndim == 2 and plain.shape == (1, 8)
+    assert plain.tolist() == [[0, 1, 2, 3, 0, 1, 2, 3]]
+
+
 # ---------------------------------------------------------------------------
 # Phase 2b: gathered prefill arm on the hybrid cache
 # ---------------------------------------------------------------------------
