@@ -24,6 +24,11 @@ aux_state pattern. Contract under test:
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -214,7 +219,53 @@ def _prefill(attn, cache, tokens: int, seed: int):
     return attn(x, cache=cache, position_ids=positions)
 
 
+_ISOLATED_CHILD_ENV = "OMLX_TQ_QSA_ISOLATED_CHILD"
+
+
 def test_gathered_decode_matches_dense_within_codec_tolerance():
+    """Run the dense-vs-hybrid comparison in a pristine subprocess.
+
+    Module-forward numeric comparisons are corrupted by lazy MLX state
+    that earlier tests in the same interpreter still hold: pending graphs
+    get submitted mid-comparison, and a start-of-test drain cannot
+    retract them (~25% flake in full-suite order, cosine 0.18-0.58
+    varying per run; passes standalone and file-granular). A fresh
+    process makes the failure class impossible by construction — no
+    prior MLX state exists in it.
+    """
+    if os.environ.get(_ISOLATED_CHILD_ENV):
+        pytest.skip("executed via the wrapper's isolated child process")
+    child = "tests/test_turboquant_qsa.py::test_gathered_decode_isolated_child"
+    env = {**os.environ, _ISOLATED_CHILD_ENV: "1"}
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            child,
+            "-q",
+            "--tb=short",
+            "-p",
+            "no:cacheprovider",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=env,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    # "1 passed" pins that the child actually ran and passed: a silent
+    # deselect/skip (marker changes, collection drift) must not read as
+    # success.
+    assert proc.returncode == 0 and "1 passed" in proc.stdout, (
+        "isolated dense-vs-hybrid comparison failed:\n"
+        f"{proc.stdout}\n{proc.stderr}"
+    )
+
+
+def test_gathered_decode_isolated_child():
+    if not os.environ.get(_ISOLATED_CHILD_ENV):
+        pytest.skip("runs only inside the wrapper's fresh subprocess")
     mx.random.seed(11)  # pin module init; the codec-tolerance band assumes
     # stable weights across the dense/hybrid comparison AND across runs.
     cfg = _text_config()
